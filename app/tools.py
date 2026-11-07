@@ -5,10 +5,13 @@
 """
 
 import json
+import random
+from datetime import datetime
 from functools import cache
 from pathlib import Path
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+LEARNING_LOG_DIR = Path(__file__).resolve().parent.parent / "learning_log"
 MAX_RESULTS = 3
 
 
@@ -77,3 +80,51 @@ def get_lecture_summary(lecture: int) -> str:
         available = sorted(p.stem for p in (DATA_DIR / "lectures").glob("*.md"))
         return f"第{lecture}回の要点はまだありません。用意されている回: {', '.join(available)}"
     return path.read_text(encoding="utf-8")
+
+
+def save_learning_log(topic: str, note: str) -> str:
+    """学習の記録を learning_log/ に保存する。
+
+    学習記録の保存を頼まれたときに使う。実際の保存前にはツールの承認機能で利用者の確認が入るため、
+    文章だけで確認を求めず、このツールを呼び出す。
+    """
+    topic = (topic or "").strip()
+    note = (note or "").strip()
+    if not topic:
+        return "保存する学習テーマが空です。topic を指定してください。"
+    if not note:
+        return "保存する学習メモが空です。note を指定してください。"
+
+    LEARNING_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    saved_at = datetime.now().strftime("%Y%m%d_%H%M%S")
+    file_name = f"{saved_at}_{topic[:20].replace(' ', '_')}.json"
+    path = LEARNING_LOG_DIR / file_name
+    payload = {
+        "topic": topic,
+        "note": note,
+        "saved_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return f"学習ログを保存しました: {path.name}"
+
+
+def make_quiz(lecture: int) -> str:
+    """指定した回の用語から1つを選び、
+    確認問題と答えを返す。
+    「第2回の確認問題を出して」のように、
+    復習用の問題を求められたときに使う。
+    """
+    terms = [term for term in load_glossary() if term["lecture"] == lecture]
+    if not terms:
+        return f"第{lecture}回の用語が見つかりませんでした。"
+
+    term = random.choice(terms)
+    return json.dumps(
+        {
+            "lecture": lecture,
+            "term": term["term"],
+            "question": f"「{term['term']}」とは何ですか？",
+            "answer": term["definition"],
+        },
+        ensure_ascii=False,
+    )
