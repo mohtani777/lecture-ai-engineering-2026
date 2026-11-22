@@ -17,7 +17,7 @@ import sqlite_vec
 from app.config import (
     EMBEDDING_DIMENSIONS, EMBEDDING_MAX_TOKENS, EMBEDDING_MODEL,
     RAG_DB, RAG_DOCUMENT_IDS, RAG_SOURCE, RAG_TOP_K, RAG_TREE, get_api_key,
-    RAG_GRAPH, GRAPH_START_K, GRAPH_HOPS, GRAPH_MAX_RESULTS,
+    RAG_GRAPH, GRAPH_START_K, GRAPH_HOPS, GRAPH_RELATED_TERM_HOPS, GRAPH_MAX_RESULTS,
 )
 
 
@@ -139,17 +139,20 @@ def search(query: str) -> list[dict]:
 
 
 def search_graph(query: str) -> dict:
-    """ベクトル検索を入口に、前後ページと共通用語で候補を広げる。"""
+    """ベクトル検索を入口に、前後ページ・共通用語・関連語で候補を広げる。"""
     pages = {page["page_id"]: page for page in load_pages(RAG_SOURCE)}
     graph = json.loads(RAG_GRAPH.read_text(encoding="utf-8"))
     nodes = {node["id"]: node for node in graph["nodes"]
              if node["kind"] == "term" or node["id"] in pages}
     adjacent = defaultdict(set)
+    relations = defaultdict(set)
     for edge in graph["edges"]:
         a, b = edge["source"], edge["target"]
-        if edge["relation"] in ("next_page", "mentions") and a in nodes and b in nodes:
+        if edge["relation"] in ("next_page", "mentions", "related_term") and a in nodes and b in nodes:
             adjacent[a].add(b)
             adjacent[b].add(a)
+            relations[(a, b)].add(edge["relation"])
+            relations[(b, a)].add(edge["relation"])
 
     seeds = [hit for hit in search(query) if hit["page_id"] in pages][:min(GRAPH_START_K, GRAPH_MAX_RESULTS)]
     seed_ids = {seed["page_id"] for seed in seeds}
@@ -158,31 +161,39 @@ def search_graph(query: str) -> dict:
         root = seed["page_id"]
         results.append({**pages[root], "distance": seed["distance"], "hops": 0,
                         "path": [{"id": root, "title": pages[root]["title"]}]})
-        queue = deque([(root, [root])])
-        visited = {root}
+        queue = deque([(root, [root], 0, 0)])
+        visited = {(root, 0, 0)}
         while queue:
-            current, path = queue.popleft()
-            if len(path) - 1 >= GRAPH_HOPS:
+            current, path, standard_hops, related_hops = queue.popleft()
+            if standard_hops >= GRAPH_HOPS and related_hops >= GRAPH_RELATED_TERM_HOPS:
                 continue
             # 同じ深さなら、接続先が少ない用語からたどる。
             neighbors = sorted(adjacent[current], key=lambda n: (len(adjacent[n]), n))
             for neighbor in neighbors:
-                if neighbor in visited:
+                edge_relations = relations[(current, neighbor)]
+                is_related = "related_term" in edge_relations
+                next_related_hops = related_hops + int(is_related)
+                next_standard_hops = standard_hops + int(not is_related)
+                if next_standard_hops > GRAPH_HOPS or next_related_hops > GRAPH_RELATED_TERM_HOPS:
                     continue
-                visited.add(neighbor)
+                state = (neighbor, next_standard_hops, next_related_hops)
+                if state in visited:
+                    continue
+                visited.add(state)
                 route = path + [neighbor]
-                queue.append((neighbor, route))
+                queue.append((neighbor, route, next_standard_hops, next_related_hops))
                 if neighbor not in pages or neighbor in seed_ids:
                     continue
                 frequency = max((len(adjacent[n]) for n in route if nodes[n]["kind"] == "term"), default=0)
-                priority = (len(route) - 1, frequency, rank, neighbor)
+                priority = (-next_related_hops, len(route) - 1, frequency, rank, neighbor)
                 candidate = {**pages[neighbor], "hops": len(route) - 1,
                              "path": [{"id": n, "title": nodes[n]["title"]} for n in route]}
                 if neighbor not in candidates or priority < candidates[neighbor][0]:
                     candidates[neighbor] = (priority, candidate)
     expanded = [candidate for _, candidate in sorted(candidates.values())]
     return {"seeds": results, "expanded": expanded[:max(0, GRAPH_MAX_RESULTS - len(results))],
-            "max_hops": GRAPH_HOPS}
+            "max_hops": GRAPH_HOPS,
+            "max_related_term_hops": GRAPH_RELATED_TERM_HOPS}
 
 
 
